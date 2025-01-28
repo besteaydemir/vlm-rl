@@ -45,7 +45,7 @@ def main():
         rejected = processor.apply_chat_template(rejected, tokenize=False)
 
         
-        max_size = 240
+        max_size = 120
         example["image"].thumbnail((max_size, max_size))
         return {
             "images": [example["image"]],
@@ -64,8 +64,8 @@ def main():
 
 
     wandb.init(
-        project="rloo_training",
-        name="idefics2-8b-rloo",
+        project="dpo_training",
+        name="idefics2-8b-dpo",
         #config={"": 1, "": }  
         )
 
@@ -76,11 +76,11 @@ def main():
         output_dir="idefics2-8b-dpo",
         bf16=True,
         gradient_checkpointing=True,
-        per_device_train_batch_size=2,
-        gradient_accumulation_steps=32,
+        per_device_train_batch_size=1,
+        gradient_accumulation_steps=16,
         num_train_epochs=2,
-        dataset_num_proc=32,  # tokenization will use 32 processes
-        dataloader_num_workers=32,  # data loading will use 32 workers
+        dataset_num_proc=8,  # tokenization will use 32 processes
+        dataloader_num_workers=8,  # data loading will use 32 workers
         logging_steps=1,
         report_to="wandb"
     )

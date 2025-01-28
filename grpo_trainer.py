@@ -71,7 +71,7 @@ class GRPOTrainer(Trainer):
                     example,
                     processing_class,
                     256, # TODO:  self.max_prompt_length, # TODO: self.max_completion_length,
-                    256,
+                    32,
                     add_special_tokens=True
                 ),
                 batched=False,
