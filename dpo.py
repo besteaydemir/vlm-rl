@@ -30,7 +30,7 @@ def main():
     model = get_peft_model(model, peft_config)
     model.print_trainable_parameters()
 
-    ## Handle dataset 
+    ## Handle dataset here!!! They all have different columns
     # Has "image", "question", "rejected", "chosen"
     dataset = load_dataset("openbmb/RLAIF-V-Dataset", split="train[:1%]")
 

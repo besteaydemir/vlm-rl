@@ -8,7 +8,8 @@ from transformers import (
     default_data_collator
 )
 from peft import get_peft_model, LoraConfig
-from trl import GRPOConfig, GRPOTrainer
+from grpo_trainer import GRPOTrainer
+from grpo_config import GRPOConfig
 import wandb
 
 def main():
@@ -74,11 +75,6 @@ def main():
         gradient_accumulation_steps=32,
         num_train_epochs=2,
         learning_rate=1e-5,
-        max_prompt_length=1024,
-        max_completion_length=256,
-        num_generations=8,
-        beta=0.1,
-        remove_unused_columns=False,
         report_to="wandb"
     )
 

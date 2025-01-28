@@ -23,16 +23,20 @@ from transformers import (
 from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
 from transformers.utils import is_peft_available
 
-from ..data_utils import apply_chat_template, is_conversational, maybe_apply_chat_template
-from ..models import create_reference_model, prepare_deepspeed, unwrap_model_for_generation
-from .grpo_config import GRPOConfig
-from .utils import generate_model_card, get_comet_experiment_url
+from data_utils import apply_chat_template, is_conversational, maybe_apply_chat_template
+from models.utils import unwrap_model_for_generation
+from modeling_base import create_reference_model
+from grpo_config import GRPOConfig
+from utils import generate_model_card, get_comet_experiment_url
 
 if is_peft_available():
     from peft import PeftConfig, get_peft_model
 
 if is_wandb_available():
     import wandb
+
+RewardFunc = Union[str, PreTrainedModel, Callable[[list, list], list[float]]]
+
 
 class GRPOTrainer(Trainer):
     _tag_names = ["trl", "grpo"]
@@ -66,8 +70,8 @@ class GRPOTrainer(Trainer):
                 lambda example: self.process_row(
                     example,
                     processing_class,
-                    self.max_prompt_length,
-                    self.max_completion_length,
+                    256, # TODO:  self.max_prompt_length, # TODO: self.max_completion_length,
+                    256,
                     add_special_tokens=True
                 ),
                 batched=False,
