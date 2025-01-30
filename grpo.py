@@ -17,7 +17,6 @@ def main():
     model_name = "HuggingFaceM4/idefics2-8b"
     model = AutoModelForVision2Seq.from_pretrained(model_name, torch_dtype=torch.bfloat16)
     processor = AutoProcessor.from_pretrained(model_name, do_image_splitting=False)
-    processor.tokenizer.pad_token = processor.tokenizer.eos_token
 
     # Reward model setup
     reward_model = AutoModelForSequenceClassification.from_pretrained(
