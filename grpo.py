@@ -27,43 +27,43 @@ def main():
 
     # PEFT configuration
     peft_config = LoraConfig(
-        target_modules=["attn.qkv", "attn.proj", "mlp.fc1", "mlp.fc2"],
-        inference_mode=False
+        target_modules="all-linear"
     )
     model = get_peft_model(model, peft_config)
     model.print_trainable_parameters()
 
     # Dataset preparation
-    dataset = load_dataset("openbmb/RLAIF-V-Dataset", split="train[:1%]")
+    dataset = load_dataset("openbmb/RLAIF-V-Dataset", split="train[:0.1%]")
 
-    def format_example(example):
-        # Prepare multimodal prompt
-        prompt = [{
-            "role": "user", 
-            "content": [
-                {"type": "image"},
-                {"type": "text", "text": example["question"]}
-            ]
-        }]
+    # def format_example(example):
+    #     # Prepare multimodal prompt
+    #     prompt = [{
+    #         "role": "user", 
+    #         "content": [
+    #             {"type": "image"},
+    #             {"type": "text", "text": example["question"]}
+    #         ]
+    #     }]
         
-        # Process images
-        example["image"].thumbnail((240, 240))
+    #     # Process images
+    #     example["image"].thumbnail((240, 240))
         
-        return {
-            "images": [example["image"]],
-            "prompt": processor.apply_chat_template(prompt, tokenize=False),
-            "chosen": example["chosen"],
-            "rejected": example["rejected"]
-        }
+    #     return {
+    #         "images": [example["image"]],
+    #         "prompt": processor.apply_chat_template(prompt, tokenize=False),
+    #         "chosen": example["chosen"],
+    #         "rejected": example["rejected"]
+    #     }
 
-    # Process dataset
-    dataset = dataset.map(format_example, remove_columns=dataset.column_names, num_proc=32)
-    dataset = dataset.cast(features.Features({
-        "images": features.Sequence(features.Image(decode=True)),
-        "prompt": features.Value("string"),
-        "chosen": features.Value("string"),
-        "rejected": features.Value("string")
-    }))
+    # # Process dataset
+    # dataset = dataset.map(format_example, remove_columns=dataset.column_names, num_proc=32)
+    # dataset = dataset.cast(features.Features({
+    #     "images": features.Sequence(features.Image(decode=True)),
+    #     "prompt": features.Value("string"),
+    #     "chosen": features.Value("string"),
+    #     "rejected": features.Value("string")
+    # }))
+    #TODO bring key setting of the dataset here
 
     # Training configuration
     training_args = GRPOConfig(

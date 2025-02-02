@@ -13,6 +13,9 @@ from transformers import (
     AutoModelForSequenceClassification,
     AutoTokenizer,
     AutoProcessor,
+    BaseImageProcessor,
+    FeatureExtractionMixin,
+    ProcessorMixin,
     GenerationConfig,
     PreTrainedModel,
     PreTrainedTokenizerBase,
@@ -48,31 +51,75 @@ class GRPOTrainer(Trainer):
         args: GRPOConfig = None,
         train_dataset: Optional[Union[Dataset, IterableDataset]] = None,
         eval_dataset: Optional[Union[Dataset, IterableDataset, dict[str, Union[Dataset, IterableDataset]]]] = None,
-        processing_class: Optional[Union[PreTrainedTokenizerBase, AutoProcessor]] = None,
-        reward_processing_classes: Optional[Union[PreTrainedTokenizerBase, list[PreTrainedTokenizerBase]]] = None,
+        processing_class: Optional[Union[PreTrainedTokenizerBase, BaseImageProcessor, FeatureExtractionMixin, ProcessorMixin]] = None,
+        reward_processing_classes: Optional[Union[PreTrainedTokenizerBase, BaseImageProcessor, FeatureExtractionMixin, ProcessorMixin, list[PreTrainedTokenizerBase, BaseImageProcessor, FeatureExtractionMixin, ProcessorMixin]]] = None,
         callbacks: Optional[list[TrainerCallback]] = None,
         optimizers: tuple[Optional[torch.optim.Optimizer], Optional[torch.optim.lr_scheduler.LambdaLR]] = (None, None),
         peft_config: Optional["PeftConfig"] = None,
     ):
-        # Args initialization and model setup remains mostly the same
-        # ...
+        # Args
+        if args is None:
+            model_name = model if isinstance(model, str) else model.config._name_or_path
+            model_name = model_name.split("/")[-1]
+            args = GRPOConfig(f"{model_name}-GRPO")
+
+        # Models
+        # Trained model
+        model_init_kwargs = args.model_init_kwargs or {}
+        if isinstance(model, str):
+            model_id = model
+            torch_dtype = model_init_kwargs.get("torch_dtype")
+            if isinstance(torch_dtype, torch.dtype) or torch_dtype == "auto" or torch_dtype is None:
+                pass  # torch_dtype is already a torch.dtype or "auto" or None
+            elif isinstance(torch_dtype, str):  # it's a str, but not "auto"
+                torch_dtype = getattr(torch, torch_dtype)
+                model_init_kwargs["torch_dtype"] = torch_dtype
+            else:
+                raise ValueError(
+                    "Invalid `torch_dtype` passed to `GRPOConfig`. Expected either 'auto' or a string representing "
+                    f"a `torch.dtype` (e.g., 'float32'), but got {torch_dtype}."
+                )
+            # Disable caching if gradient checkpointing is enabled (not supported)
+            model_init_kwargs["use_cache"] = (
+                False if args.gradient_checkpointing else model_init_kwargs.get("use_cache")
+            )
+            model = AutoModelForCausalLM.from_pretrained(model, **model_init_kwargs)
+        else:
+            model_id = model.config._name_or_path
+            if args.model_init_kwargs is not None:
+                raise ValueError(
+                    "You passed `model_init_kwargs` to the `GRPOConfig`, but your model is already instantiated. "
+                    "This argument can only be used when the `model` argument is a string."
+                )
+
+        if peft_config is not None:
+            model = get_peft_model(model, peft_config)
+
+        # Reference model
+        if is_deepspeed_zero3_enabled():
+            self.ref_model = AutoModelForCausalLM.from_pretrained(model_id, **model_init_kwargs)
+        elif peft_config is None:
+            # If PEFT configuration is not provided, create a reference model based on the initial model.
+            self.ref_model = create_reference_model(model)
+        else:
+            # If PEFT is used, the reference model is not needed since the adapter can be disabled
+            # to revert to the initial model.
+            self.ref_model = None        
 
         # Processing class for VL models
         if processing_class is None:
-            try:
-                processing_class = AutoProcessor.from_pretrained(model_id, padding_side="left")
-            except Exception:
-                processing_class = AutoTokenizer.from_pretrained(model_id, padding_side="left")
+            processing_class = AutoProcessor.from_pretrained(model_id, padding_side="left")
 
         # Preprocess datasets
         if train_dataset is not None:
             train_dataset = train_dataset.map(
                 lambda example: self.process_row(
+                    #remove_columns=["prompt", "chosen", "rejected"], TODO
                     example,
                     processing_class,
-                    256, # TODO:  self.max_prompt_length, # TODO: self.max_completion_length,
+                    32, # TODO:  self.max_prompt_length, # TODO: self.max_completion_length,
                     32,
-                    add_special_tokens=True
+                    add_special_tokens=False
                 ),
                 batched=False,
             )
@@ -85,7 +132,7 @@ class GRPOTrainer(Trainer):
                             processing_class,
                             self.max_prompt_length,
                             self.max_completion_length,
-                            add_special_tokens=True
+                            add_special_tokens=False
                         ),
                         batched=False,
                     )
@@ -96,30 +143,68 @@ class GRPOTrainer(Trainer):
                         processing_class,
                         self.max_prompt_length,
                         self.max_completion_length,
-                        add_special_tokens=True
+                        add_special_tokens=False
                     ),
                     batched=False,
                 )
 
-        # Data collator
+                # Reward functions
+        if not isinstance(reward_funcs, list):
+            reward_funcs = [reward_funcs]
+        for i, reward_func in enumerate(reward_funcs):
+            if isinstance(reward_func, str):
+                reward_funcs[i] = AutoModelForSequenceClassification.from_pretrained(
+                    reward_func, num_labels=1, **model_init_kwargs
+                )
+        self.reward_funcs = reward_funcs
+
+        # Reward processing class
+        if reward_processing_classes is None:
+            reward_processing_classes = [None] * len(reward_funcs)
+        elif not isinstance(reward_processing_classes, list):
+            reward_processing_classes = [reward_processing_classes]
+        else:
+            if len(reward_processing_classes) != len(reward_funcs):
+                raise ValueError("The number of reward processing classes must match the number of reward functions.")
+
+        for i, (reward_processing_class, reward_func) in enumerate(zip(reward_processing_classes, reward_funcs)):
+            if isinstance(reward_func, PreTrainedModel):
+                if reward_processing_class is None:
+                    reward_processing_class = AutoTokenizer.from_pretrained(reward_func.config._name_or_path)
+                if reward_processing_class.pad_token_id is None:
+                    reward_processing_class.pad_token = reward_processing_class.eos_token
+                # The reward model computes the reward for the latest non-padded token in the input sequence.
+                # So it's important to set the pad token ID to the padding token ID of the processing class.
+                reward_func.config.pad_token_id = reward_processing_class.pad_token_id
+                reward_processing_classes[i] = reward_processing_class
+        self.reward_processing_classes = reward_processing_classes
+
+        for i, reward_func in enumerate(self.reward_funcs):
+            if isinstance(reward_func, PreTrainedModel):
+                self.reward_funcs[i] = self.accelerator.prepare_model(reward_func, evaluation_mode=True)
+
+
         def data_collator(features):
-            pixel_values = torch.stack([f["pixel_values"] for f in features])
-            prompt_input_ids = [torch.tensor(f["prompt_input_ids"]) for f in features]
-            prompt_input_ids = torch.nn.utils.rnn.pad_sequence(
-                prompt_input_ids,
-                batch_first=True,
-                padding_value=processing_class.tokenizer.pad_token_id
-            )
-            batch = {
-                "pixel_values": pixel_values,
-                "prompt_input_ids": prompt_input_ids,
-                "prompt": [f["prompt"] for f in features],
-            }
-            if "pixel_attention_mask" in features[0]:
-                batch["pixel_attention_mask"] = torch.stack([f["pixel_attention_mask"] for f in features])
-            if "image_sizes" in features[0]:
-                batch["image_sizes"] = torch.stack([f["image_sizes"] for f in features])
-            return batch
+        # print(len([f["pixel_values"] for f in features][0]))
+
+        # pixel_values = torch.stack([f["pixel_values"] for f in features])
+        # prompt_input_ids = [torch.tensor(f["prompt_input_ids"]) for f in features]
+        # prompt_input_ids = torch.nn.utils.rnn.pad_sequence(
+        #     prompt_input_ids,
+        #     batch_first=True,
+        #     padding_value=processing_class.tokenizer.pad_token_id
+        # )
+        # batch = {
+        #     "pixel_values": pixel_values,
+        #     "prompt_input_ids": prompt_input_ids,
+        #     "prompt": [f["prompt"] for f in features],
+        # }
+        # if "pixel_attention_mask" in features[0]:
+        #     batch["pixel_attention_mask"] = torch.stack([f["pixel_attention_mask"] for f in features])
+        # if "image_sizes" in features[0]:
+        #     batch["image_sizes"] = torch.stack([f["image_sizes"] for f in features])
+            return features
+
 
         super().__init__(
             model=model,
@@ -132,6 +217,7 @@ class GRPOTrainer(Trainer):
             optimizers=optimizers,
         )
 
+  
     @staticmethod
     def process_row(
         features,
@@ -141,9 +227,9 @@ class GRPOTrainer(Trainer):
         add_special_tokens
     ):
         processor = processing_class
-        processed_features = processor(images=features["images"], text=features["prompt"], add_special_tokens=False)
+        processed_features = processor(images=features["image"], text="<image>" + features["question"], add_special_tokens=False)
         prompt_input_ids = processed_features["input_ids"][0]
-        pixel_values = processed_features["pixel_values"][0]
+        pixel_values = processed_features["pixel_values"][0] #TODO does  GRPO expect batch or single
 
         if add_special_tokens:
             if processor.tokenizer.bos_token_id is not None:
@@ -157,7 +243,7 @@ class GRPOTrainer(Trainer):
         output = {
             "prompt_input_ids": prompt_input_ids,
             "pixel_values": pixel_values,
-            "prompt": features["prompt"],
+            "prompt": features["question"],
         }
 
         if "pixel_attention_mask" in processed_features:
@@ -328,3 +414,5 @@ class GRPOTrainer(Trainer):
         self._metrics["completion_length"].append(completion_mask.sum(dim=1).float().mean().item())
 
         return final_loss
+
+    
