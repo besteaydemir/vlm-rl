@@ -248,45 +248,414 @@ class GRPOTrainer(Trainer):
                 reward_processing_classes[i] = reward_processing_class
         self.reward_processing_classes = reward_processing_classes
 
-        for i, reward_func in enumerate(self.reward_funcs):
+        # for i, reward_func in enumerate(self.reward_funcs):
+        #     if isinstance(reward_func, PreTrainedModel):
+        #         self.reward_funcs[i] = self.accelerator.prepare_model(reward_func, evaluation_mode=True)
+            # Data collator
+        def data_collator(features):  # No data collation is needed in GRPO
+            return features
+
+        # Training arguments
+        self.max_prompt_length = args.max_prompt_length
+        self.max_completion_length = args.max_completion_length  # = |o_i| in the GRPO paper
+        self.num_generations = args.num_generations  # = G in the GRPO paper
+        self.use_vllm = args.use_vllm
+
+        self.beta = args.beta
+
+        # The trainer estimates the number of FLOPs (floating-point operations) using the number of elements in the
+        # input tensor associated with the key "input_ids". However, in GRPO, the sampled data does not include the
+        # "input_ids" key. Instead, the available keys is "prompt". As a result, the trainer issues the warning:
+        # "Could not estimate the number of tokens of the input, floating-point operations will not be computed." To
+        # suppress this warning, we set the "estimate_tokens" key in the model's "warnings_issued" dictionary to True.
+        # This acts as a flag to indicate that the warning has already been issued.
+        model.warnings_issued["estimate_tokens"] = True
+
+        # Initialize the metrics
+        self._metrics = defaultdict(list)
+        self.log_completions = args.log_completions
+
+        super().__init__(
+            model=model,
+            args=args,
+            data_collator=data_collator,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            processing_class=processing_class,
+            callbacks=callbacks,
+            optimizers=optimizers,
+        )
+
+        # Check if the per_device_train/eval_batch_size * num processes can be divided by the number of generations
+        num_processes = self.accelerator.num_processes
+        global_batch_size = args.per_device_train_batch_size * num_processes
+        possible_values = [n_gen for n_gen in range(2, global_batch_size + 1) if (global_batch_size) % n_gen == 0]
+        if self.num_generations not in possible_values:
+            raise ValueError(
+                f"The global train batch size ({num_processes} x {args.per_device_train_batch_size}) must be evenly "
+                f"divisible by the number of generations per prompt ({self.num_generations}). Given the current train "
+                f"batch size, the valid values for the number of generations are: {possible_values}."
+            )
+        if self.args.eval_strategy != "no":
+            global_batch_size = args.per_device_eval_batch_size * num_processes
+            possible_values = [n_gen for n_gen in range(2, global_batch_size + 1) if (global_batch_size) % n_gen == 0]
+            if self.num_generations not in possible_values:
+                raise ValueError(
+                    f"The global eval batch size ({num_processes} x {args.per_device_eval_batch_size}) must be evenly "
+                    f"divisible by the number of generations per prompt ({self.num_generations}). Given the current "
+                    f"eval batch size, the valid values for the number of generations are: {possible_values}."
+                )
+
+        if self.use_vllm:
+            if not is_vllm_available():
+                raise ImportError(
+                    "vLLM is not available and `use_vllm` is set to True. Please install vLLM with "
+                    "`pip install vllm` to use it."
+                )
+
+            if self.accelerator.is_main_process:
+                vllm_device = self.args.vllm_device
+                if vllm_device == "auto":
+                    vllm_device = f"cuda:{self.accelerator.num_processes}"  # take the next GPU idx
+                # Check that the requested device is available
+                if vllm_device.split(":")[0] == "cuda" and int(vllm_device.split(":")[1]) >= torch.cuda.device_count():
+                    raise ValueError(
+                        f"The requested device for vllm ({vllm_device}) is not available. You are likely using vLLM "
+                        "without restricting the number of GPUs for training. Set the `--num_processes` argument to a "
+                        "value lower than the number of GPUs available on your machine—typically, reducing it by one "
+                        f"is sufficient. In your case: `--num_processes {torch.cuda.device_count() - 1}`."
+                    )
+                # Check that the requested device is not also used for training
+                if vllm_device in {f"cuda:{idx}" for idx in range(self.accelerator.num_processes)}:
+                    warnings.warn(
+                        f"The requested device {vllm_device} is also used for training. This may lead to unexpected "
+                        "behavior. It is recommended to use a dedicated device for vLLM."
+                    )
+                # vLLM is not compatible with accelerate. So we need to patch it to make sure we can (1) place the vLLM
+                # model on the desired device (world_size_patch) and (2) avoid a test that is not designed for our
+                # setting (profiling_patch).
+                world_size_patch = patch("torch.distributed.get_world_size", return_value=1)
+                profiling_patch = patch(
+                    "vllm.worker.worker.Worker._assert_memory_footprint_increased_during_profiling", return_value=None
+                )
+                with world_size_patch, profiling_patch:
+                    self.llm = LLM(
+                        model=model.name_or_path,
+                        device=vllm_device,
+                        gpu_memory_utilization=self.args.vllm_gpu_memory_utilization,
+                        dtype=self.args.vllm_dtype,
+                        # Automatic Prefix Caching caches the KV cache of existing queries, so that a new query can
+                        # directly reuse the KV cache if it shares the same prefix with one of the existing queries.
+                        # This is particularly useful here because we generate completions from the same prompts.
+                        enable_prefix_caching=True,
+                        max_model_len=self.args.vllm_max_model_len,
+                    )
+                self.sampling_params = SamplingParams(
+                    temperature=args.temperature,
+                    max_tokens=self.max_completion_length,
+                )
+
+            self._last_loaded_step = 0  # tag to avoid useless loading during grad accumulation
+
+            # When using vLLM, the main process is responsible for loading the model weights. This can cause process
+            # desynchronization and seems to lead to DeepSpeed hanging during initialization. To prevent this, we
+            # synchronize all processes after vLLM has been fully initialized.
+            self.accelerator.wait_for_everyone()
+        else:
+            self.generation_config = GenerationConfig(
+                max_new_tokens=self.max_completion_length,
+                do_sample=True,
+                temperature=args.temperature,
+                pad_token_id=processing_class.pad_token_id,
+            )
+
+        # Gradient accumulation requires scaled loss. Normally, loss scaling in the parent class depends on whether the
+        # model accepts loss-related kwargs. Since we compute our own loss, this check is irrelevant. We set
+        # self.model_accepts_loss_kwargs to False to enable scaling.
+        self.model_accepts_loss_kwargs = False
+
+        # Add tags to the model
+        self.model.add_model_tags(self._tag_names)
+
+        if self.ref_model is not None:
+            if self.is_deepspeed_enabled:
+                self.ref_model = prepare_deepspeed(self.ref_model, self.accelerator)
+            else:
+                self.ref_model = self.accelerator.prepare_model(self.ref_model, evaluation_mode=True)
+
+        if args.sync_ref_model:
+            self.add_callback(SyncRefModelCallback(ref_model=self.ref_model, accelerator=self.accelerator))
+
+       for i, reward_func in enumerate(self.reward_funcs):
             if isinstance(reward_func, PreTrainedModel):
                 self.reward_funcs[i] = self.accelerator.prepare_model(reward_func, evaluation_mode=True)
 
+    def _set_signature_columns_if_needed(self): #TODO see this after the dataset
+        # If `self.args.remove_unused_columns` is True, non-signature columns are removed.
+        # By default, this method sets `self._signature_columns` to the model's expected inputs.
+        # In GRPOTrainer, we preprocess data, so using the model's signature columns doesn't work.
+        # Instead, we set them to the columns expected by the `training_step` method, hence the override.
+        if self._signature_columns is None:
+            self._signature_columns = ["prompt"]
+
+    # We need a custom sampler that samples the same prompt multiple times
+    def _get_train_sampler(self) -> Sampler:
+        return RepeatRandomSampler(self.train_dataset, self.num_generations)
+
+    def _get_eval_sampler(self, eval_dataset) -> Sampler:
+        return RepeatRandomSampler(eval_dataset, self.num_generations)
+
+    # Get the per-token log probabilities for the completions 
+    # (now handles vision-language model inputs)
+    def _get_per_token_logps(self, model, input_ids, pixel_values, attention_mask=None, logits_to_keep, **kwargs):
+        # Forward pass with both text and image inputs
+        # We add 1 to `logits_to_keep` because the last logits of the sequence is later excluded
+        outputs = model( #TODO bring back the normal version if passed to a text only model
+            input_ids=input_ids,
+            pixel_values=pixel_values,
+            attention_mask=attention_mask,
+            logits_to_keep=logits_to_keep + 1,
+            **kwargs
+        )
+        logits = outputs.logits  # (B, L, V)
+        logits = logits[:, :-1, :]  #exclude the last logit: it corresponds to the next token pred
+        input_ids = input_ids[:, -logits_to_keep:]  # Remove first token
+        
+
+        logits = logits[:, -logits_to_keep:]
+        # # Calculate per-token log probabilities
+        # log_probs = logits.log_softmax(dim=-1)
+        # per_token_logps = torch.gather(
+        #     log_probs, 
+        #     dim=-1, 
+        #     index=input_ids.unsqueeze(-1)
+        # ).squeeze(-1)
+        
+        # return per_token_logps
+        return selective_log_softmax(logits, input_ids)
   
-    @staticmethod
-    def process_row(
-        features,
-        processing_class,
-        max_prompt_length,
-        max_completion_length,
-        add_special_tokens
-    ):
-        processor = processing_class
-        processed_features = processor(images=features["image"], text="<image>" + features["question"], add_special_tokens=False)
-        prompt_input_ids = processed_features["input_ids"][0]
-        pixel_values = processed_features["pixel_values"][0] #TODO does  GRPO expect batch or single
+    # @staticmethod
+    # def process_row(
+    #     features,
+    #     processing_class,
+    #     max_prompt_length,
+    #     max_completion_length,
+    #     add_special_tokens
+    # ):
+    #     processor = processing_class
+    #     processed_features = processor(images=features["image"], text="<image>" + features["question"], add_special_tokens=False)
+    #     prompt_input_ids = processed_features["input_ids"][0]
+    #     pixel_values = processed_features["pixel_values"][0] #TODO does  GRPO expect batch or single
 
-        if add_special_tokens:
-            if processor.tokenizer.bos_token_id is not None:
-                prompt_input_ids = [processor.tokenizer.bos_token_id] + prompt_input_ids
-            if processor.tokenizer.eos_token_id is not None:
-                prompt_input_ids = prompt_input_ids + [processor.tokenizer.eos_token_id]
+    #     if add_special_tokens:
+    #         if processor.tokenizer.bos_token_id is not None:
+    #             prompt_input_ids = [processor.tokenizer.bos_token_id] + prompt_input_ids
+    #         if processor.tokenizer.eos_token_id is not None:
+    #             prompt_input_ids = prompt_input_ids + [processor.tokenizer.eos_token_id]
 
-        if max_prompt_length is not None:
-            prompt_input_ids = prompt_input_ids[-max_prompt_length:]
+    #     if max_prompt_length is not None:
+    #         prompt_input_ids = prompt_input_ids[-max_prompt_length:]
 
-        output = {
-            "prompt_input_ids": prompt_input_ids,
-            "pixel_values": pixel_values,
-            "prompt": features["question"],
+    #     output = {
+    #         "prompt_input_ids": prompt_input_ids,
+    #         "pixel_values": pixel_values,
+    #         "prompt": features["question"],
+    #     }
+
+    #     if "pixel_attention_mask" in processed_features:
+    #         output["pixel_attention_mask"] = processed_features["pixel_attention_mask"][0]
+    #     if "image_sizes" in processed_features:
+    #         output["image_sizes"] = processed_features["image_sizes"][0]
+
+    #     return output
+
+    def _prepare_inputs(self, inputs: dict[str, Union[torch.Tensor, Any]]) -> dict[str, Union[torch.Tensor, Any]]:
+        device = self.accelerator.device
+        prompts = [x["prompt"] for x in inputs] # list for the whole inputs
+        images = [x["image"] for x in inputs]
+        prompts_text = message_list = [     {"role": "user", "content": [
+                                            {"type": "image", "image": image},
+                                            {"type": "text", "text": prompt}
+                                        ]}
+                                        for image, prompt in zip(images, prompts)
+                                    ]
+        prompts_text = [self.processing_class.apply_chat_template(message) for message in message_list]
+        prompt_inputs = self.processing_class(
+            prompts_text, pixel_values = pixel_values, return_tensors="pt", padding=True, padding_side="left", add_special_tokens=False
+        )
+        prompt_inputs = super()._prepare_inputs(prompt_inputs)
+        prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
+
+        if self.max_prompt_length is not None:
+            prompt_ids = prompt_ids[:, -self.max_prompt_length :]
+            prompt_mask = prompt_mask[:, -self.max_prompt_length :]
+
+        # Generate completions using either vLLM or regular generation
+        if self.args.use_vllm:
+            # First, have main process load weights if needed
+            if self.state.global_step != self._last_loaded_step:
+                with unwrap_model_for_generation(
+                    self.model, self.accelerator, gather_deepspeed3_params=self.args.ds3_gather_for_generation
+                ) as unwrapped_model:
+                    if is_compiled_module(unwrapped_model):
+                        state_dict = unwrapped_model._orig_mod.state_dict()
+                    else:
+                        state_dict = unwrapped_model.state_dict()
+                if self.accelerator.is_main_process:
+                    llm_model = self.llm.llm_engine.model_executor.driver_worker.model_runner.model
+                    llm_model.load_weights(state_dict.items())
+                self._last_loaded_step = self.state.global_step
+
+            # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
+            all_prompts_text = gather_object(prompts_text)
+            if self.accelerator.is_main_process:
+                outputs = self.llm.generate(all_prompts_text, sampling_params=self.sampling_params, use_tqdm=False)
+                completion_ids = [out.token_ids for completions in outputs for out in completions.outputs]
+            else:
+                completion_ids = [None] * len(all_prompts_text)
+            # Broadcast the completions from the main process to all processes, ensuring each process receives its
+            # corresponding slice.
+            completion_ids = broadcast_object_list(completion_ids, from_process=0)
+            process_slice = slice(
+                self.accelerator.process_index * len(prompts),
+                (self.accelerator.process_index + 1) * len(prompts),
+            )
+            completion_ids = completion_ids[process_slice]
+
+            # Pad the completions, and concatenate them with the prompts
+            completion_ids = [torch.tensor(ids, device=device) for ids in completion_ids]
+            completion_ids = pad(completion_ids, padding_value=self.processing_class.pad_token_id)
+            prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+        else:
+            # Regular generation path
+            with unwrap_model_for_generation(self.model, self.accelerator) as unwrapped_model:
+                prompt_completion_ids = unwrapped_model.generate(
+                    prompt_ids, attention_mask=prompt_mask, generation_config=self.generation_config
+                )
+
+            # Compute prompt length and extract completion ids
+            prompt_length = prompt_ids.size(1)
+            prompt_ids = prompt_completion_ids[:, :prompt_length]
+            completion_ids = prompt_completion_ids[:, prompt_length:]
+
+        # Mask everything after the first EOS token
+        is_eos = completion_ids == self.processing_class.eos_token_id
+        eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
+        eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
+        sequence_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
+        completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
+
+        # Concatenate prompt_mask with completion_mask for logit computation
+        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)  # (B*G, P+C)
+
+        logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
+
+        with torch.inference_mode():
+            if self.ref_model is not None:
+                ref_per_token_logps = self._get_per_token_logps(
+                    self.ref_model, prompt_completion_ids, attention_mask, logits_to_keep
+                )
+            else:
+                with self.accelerator.unwrap_model(self.model).disable_adapter():
+                    ref_per_token_logps = self._get_per_token_logps(
+                        self.model, prompt_completion_ids, attention_mask, logits_to_keep
+                    )
+
+        # Decode the generated completions
+        completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
+        if is_conversational(inputs[0]):
+            completions = [[{"role": "assistant", "content": completion}] for completion in completions_text]
+        else:
+            completions = completions_text
+
+        rewards_per_func = torch.zeros(len(prompts), len(self.reward_funcs), device=device)
+        for i, (reward_func, reward_processing_class) in enumerate(
+            zip(self.reward_funcs, self.reward_processing_classes)
+        ):
+            if isinstance(reward_func, nn.Module):  # Module instead of PretrainedModel for compat with compiled models
+                if is_conversational(inputs[0]):
+                    messages = [{"messages": p + c} for p, c in zip(prompts, completions)]
+                    texts = [apply_chat_template(x, reward_processing_class)["text"] for x in messages]
+                else:
+                    texts = [p + c for p, c in zip(prompts, completions)]
+                reward_inputs = reward_processing_class(
+                    texts, return_tensors="pt", padding=True, padding_side="right", add_special_tokens=False
+                )
+                reward_inputs = super()._prepare_inputs(reward_inputs)
+                with torch.inference_mode():
+                    rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]  # Shape (B*G,)
+            else:
+                # Repeat all input columns (but "prompt" and "completion") to match the number of generations
+                keys = [key for key in inputs[0] if key not in ["prompt", "completion"]]
+                reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
+                output_reward_func = reward_func(prompts=prompts, completions=completions, **reward_kwargs)
+                rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
+
+        # Gather the reward per function: this part is crucial, because the rewards are normalized per group and the
+        # completions may be distributed across processes
+        rewards_per_func = gather(rewards_per_func)
+
+        # Sum the rewards from all reward functions
+        rewards = rewards_per_func.sum(dim=1)
+
+        # Compute grouped-wise rewards
+        mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
+        std_grouped_rewards = rewards.view(-1, self.num_generations).std(dim=1)
+
+        # Normalize the rewards to compute the advantages
+        mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
+        std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
+        advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4)
+
+        # Slice to keep only the local part of the data
+        process_slice = slice(
+            self.accelerator.process_index * len(prompts),
+            (self.accelerator.process_index + 1) * len(prompts),
+        )
+        advantages = advantages[process_slice]
+
+        # Log the metrics
+        reward_per_func = rewards_per_func.mean(0)
+        for i, reward_func in enumerate(self.reward_funcs):
+            if isinstance(reward_func, nn.Module):  # Module instead of PretrainedModel for compat with compiled models
+                reward_func_name = reward_func.config._name_or_path.split("/")[-1]
+            else:
+                reward_func_name = reward_func.__name__
+            self._metrics[f"rewards/{reward_func_name}"].append(reward_per_func[i].item())
+
+        self._metrics["reward"].append(rewards.mean().item())
+        self._metrics["reward_std"].append(std_grouped_rewards.mean().item())
+
+        if (
+            self.log_completions
+            and self.state.global_step % self.args.logging_steps == 0
+            and "wandb" in self.args.report_to
+        ):
+            import pandas as pd
+
+            # For logging
+            table = {
+                "step": [str(self.state.global_step)] * len(rewards),
+                "prompt": gather_object(prompts_text),
+                "completion": gather_object(completions_text),
+                "reward": rewards.tolist(),
+            }
+            df = pd.DataFrame(table)
+
+            if wandb.run is not None and self.accelerator.is_main_process:
+                wandb.log({"completions": wandb.Table(dataframe=df)})
+
+        return {
+            "prompt_ids": prompt_ids,
+            "prompt_mask": prompt_mask,
+            "completion_ids": completion_ids,
+            "completion_mask": completion_mask,
+            "ref_per_token_logps": ref_per_token_logps,
+            "advantages": advantages,
         }
 
-        if "pixel_attention_mask" in processed_features:
-            output["pixel_attention_mask"] = processed_features["pixel_attention_mask"][0]
-        if "image_sizes" in processed_features:
-            output["image_sizes"] = processed_features["image_sizes"][0]
 
-        return output
+
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         if return_outputs:
@@ -316,27 +685,32 @@ class GRPOTrainer(Trainer):
 
         # Get the per-token log probabilities for the completions 
         # (now handles vision-language model inputs)
-        def get_per_token_logps(model, input_ids, pixel_values, attention_mask=None, **kwargs):
+        def _get_per_token_logps(self, model, input_ids, pixel_values, attention_mask=None, logits_to_keep, **kwargs):
             # Forward pass with both text and image inputs
-            outputs = model(
+            # We add 1 to `logits_to_keep` because the last logits of the sequence is later excluded
+            outputs = model( #TODO bring back the normal version if passed to a text only model
                 input_ids=input_ids,
                 pixel_values=pixel_values,
                 attention_mask=attention_mask,
+                logits_to_keep=logits_to_keep + 1,
                 **kwargs
             )
             logits = outputs.logits  # (B, L, V)
-            logits = logits[:, :-1, :]  # Shift to align with input_ids[1:]
-            input_ids = input_ids[:, 1:]  # Remove first token
+            logits = logits[:, :-1, :]  #exclude the last logit: it corresponds to the next token pred
+            input_ids = input_ids[:, -logits_to_keep:]  # Remove first token
             
-            # Calculate per-token log probabilities
-            log_probs = logits.log_softmax(dim=-1)
-            per_token_logps = torch.gather(
-                log_probs, 
-                dim=-1, 
-                index=input_ids.unsqueeze(-1)
-            ).squeeze(-1)
+
+            logits = logits[:, -logits_to_keep:]
+            # # Calculate per-token log probabilities
+            # log_probs = logits.log_softmax(dim=-1)
+            # per_token_logps = torch.gather(
+            #     log_probs, 
+            #     dim=-1, 
+            #     index=input_ids.unsqueeze(-1)
+            # ).squeeze(-1)
             
-            return per_token_logps
+            # return per_token_logps
+            return selective_log_softmax(logits, input_ids)
 
         # Calculate log probabilities for current policy
         per_token_logps = get_per_token_logps(
