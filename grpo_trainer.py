@@ -35,10 +35,44 @@ from utils import generate_model_card, get_comet_experiment_url
 if is_peft_available():
     from peft import PeftConfig, get_peft_model
 
+# if is_vllm_available():
+#     from vllm import LLM, SamplingParams
+
 if is_wandb_available():
     import wandb
 
 RewardFunc = Union[str, PreTrainedModel, Callable[[list, list], list[float]]]
+
+
+# class RepeatRandomSampler(Sampler):
+#     """
+#     Sampler that repeats the indices of a dataset N times.
+
+#     Args:
+#         data_source (`Sized`):
+#             Dataset to sample from.
+#         repeat_count (`int`):
+#             Number of times to repeat each index.
+
+#     Example:
+#     ```python
+#     >>> sampler = RepeatRandomSampler(["a", "b", "c", "d"], repeat_count=2)
+#     >>> list(sampler)
+#     [2, 2, 0, 0, 3, 3, 1, 1]
+#     ```
+#     """
+
+#     def __init__(self, data_source: Sized, repeat_count: int):
+#         self.data_source = data_source
+#         self.repeat_count = repeat_count
+#         self.num_samples = len(data_source)
+
+#     def __iter__(self):
+#         indexes = [idx for idx in torch.randperm(self.num_samples).tolist() for _ in range(self.repeat_count)]
+#         return iter(indexes)
+
+#     def __len__(self):
+#         return self.num_samples * self.repeat_count
 
 
 class GRPOTrainer(Trainer):
@@ -108,80 +142,46 @@ class GRPOTrainer(Trainer):
 
         # Processing class for VL models
         if processing_class is None:
-            processing_class = AutoProcessor.from_pretrained(model_id, padding_side="left")
+            processing_class = AutoProcessor.from_pretrained(model.config._name_or_path, padding_side="left")
 
-        # Preprocess datasets
-        if train_dataset is not None:
-            train_dataset = train_dataset.map(
-                lambda example: self.process_row(
-                    #remove_columns=["prompt", "chosen", "rejected"], TODO
-                    example,
-                    processing_class,
-                    32, # TODO:  self.max_prompt_length, # TODO: self.max_completion_length,
-                    32,
-                    add_special_tokens=False
-                ),
-                batched=False,
-            )
-        if eval_dataset is not None:
-            if isinstance(eval_dataset, dict):
-                for key in eval_dataset:
-                    eval_dataset[key] = eval_dataset[key].map(
-                        lambda example: self.process_row(
-                            example,
-                            processing_class,
-                            self.max_prompt_length,
-                            self.max_completion_length,
-                            add_special_tokens=False
-                        ),
-                        batched=False,
-                    )
-            else:
-                eval_dataset = eval_dataset.map(
-                    lambda example: self.process_row(
-                        example,
-                        processing_class,
-                        self.max_prompt_length,
-                        self.max_completion_length,
-                        add_special_tokens=False
-                    ),
-                    batched=False,
-                )
+        # # Preprocess datasets
+        # if train_dataset is not None:
+        #     train_dataset = train_dataset.map(
+        #         lambda example: self.process_row(
+        #             #remove_columns=["prompt", "chosen", "rejected"], TODO
+        #             example,
+        #             processing_class,
+        #             32, # TODO:  self.max_prompt_length, # TODO: self.max_completion_length,
+        #             32,
+        #             add_special_tokens=False
+        #         ),
+        #         batched=False,
+        #     )
+        # if eval_dataset is not None:
+        #     if isinstance(eval_dataset, dict):
+        #         for key in eval_dataset:
+        #             eval_dataset[key] = eval_dataset[key].map(
+        #                 lambda example: self.process_row(
+        #                     example,
+        #                     processing_class,
+        #                     self.max_prompt_length,
+        #                     self.max_completion_length,
+        #                     add_special_tokens=False
+        #                 ),
+        #                 batched=False,
+        #             )
+        #     else:
+        #         eval_dataset = eval_dataset.map(
+        #             lambda example: self.process_row(
+        #                 example,
+        #                 processing_class,
+        #                 self.max_prompt_length,
+        #                 self.max_completion_length,
+        #                 add_special_tokens=False
+        #             ),
+        #             batched=False,
+        #         )
 
-                # Reward functions
-        if not isinstance(reward_funcs, list):
-            reward_funcs = [reward_funcs]
-        for i, reward_func in enumerate(reward_funcs):
-            if isinstance(reward_func, str):
-                reward_funcs[i] = AutoModelForSequenceClassification.from_pretrained(
-                    reward_func, num_labels=1, **model_init_kwargs
-                )
-        self.reward_funcs = reward_funcs
-
-        # Reward processing class
-        if reward_processing_classes is None:
-            reward_processing_classes = [None] * len(reward_funcs)
-        elif not isinstance(reward_processing_classes, list):
-            reward_processing_classes = [reward_processing_classes]
-        else:
-            if len(reward_processing_classes) != len(reward_funcs):
-                raise ValueError("The number of reward processing classes must match the number of reward functions.")
-
-        for i, (reward_processing_class, reward_func) in enumerate(zip(reward_processing_classes, reward_funcs)):
-            if isinstance(reward_func, PreTrainedModel):
-                if reward_processing_class is None:
-                    reward_processing_class = AutoTokenizer.from_pretrained(reward_func.config._name_or_path)
-                if reward_processing_class.pad_token_id is None:
-                    reward_processing_class.pad_token = reward_processing_class.eos_token
-                # The reward model computes the reward for the latest non-padded token in the input sequence.
-                # So it's important to set the pad token ID to the padding token ID of the processing class.
-                reward_func.config.pad_token_id = reward_processing_class.pad_token_id
-                reward_processing_classes[i] = reward_processing_class
-        self.reward_processing_classes = reward_processing_classes
-
-        for i, reward_func in enumerate(self.reward_funcs):
-            if isinstance(reward_func, PreTrainedModel):
-                self.reward_funcs[i] = self.accelerator.prepare_model(reward_func, evaluation_mode=True)
 
 
         def data_collator(features):
@@ -216,6 +216,41 @@ class GRPOTrainer(Trainer):
             callbacks=callbacks,
             optimizers=optimizers,
         )
+
+        # Reward functions
+        if not isinstance(reward_funcs, list):
+            reward_funcs = [reward_funcs]
+        for i, reward_func in enumerate(reward_funcs):
+            if isinstance(reward_func, str):
+                reward_funcs[i] = AutoModelForSequenceClassification.from_pretrained(
+                    reward_func, num_labels=1, **model_init_kwargs
+                )
+        self.reward_funcs = reward_funcs
+
+        # Reward processing class
+        if reward_processing_classes is None:
+            reward_processing_classes = [None] * len(reward_funcs)
+        elif not isinstance(reward_processing_classes, list):
+            reward_processing_classes = [reward_processing_classes]
+        else:
+            if len(reward_processing_classes) != len(reward_funcs):
+                raise ValueError("The number of reward processing classes must match the number of reward functions.")
+
+        for i, (reward_processing_class, reward_func) in enumerate(zip(reward_processing_classes, reward_funcs)):
+            if isinstance(reward_func, PreTrainedModel):
+                if reward_processing_class is None:
+                    reward_processing_class = AutoProcessor.from_pretrained(reward_func.config._name_or_path)
+                if reward_processing_class.pad_token_id is None:
+                    reward_processing_class.pad_token = reward_processing_class.eos_token
+                # The reward model computes the reward for the latest non-padded token in the input sequence.
+                # So it's important to set the pad token ID to the padding token ID of the processing class.
+                reward_func.config.pad_token_id = reward_processing_class.pad_token_id
+                reward_processing_classes[i] = reward_processing_class
+        self.reward_processing_classes = reward_processing_classes
+
+        for i, reward_func in enumerate(self.reward_funcs):
+            if isinstance(reward_func, PreTrainedModel):
+                self.reward_funcs[i] = self.accelerator.prepare_model(reward_func, evaluation_mode=True)
 
   
     @staticmethod

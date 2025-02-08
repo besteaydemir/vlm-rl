@@ -33,7 +33,7 @@ def main():
     model.print_trainable_parameters()
 
     # Dataset preparation
-    dataset = load_dataset("openbmb/RLAIF-V-Dataset", split="train[:0.1%]")
+    dataset = load_dataset("openbmb/RLAIF-V-Dataset", split="train[:1%]")
 
     # def format_example(example):
     #     # Prepare multimodal prompt
