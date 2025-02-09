@@ -61,6 +61,22 @@ if is_peft_available():
     from peft import LoraConfig, PeftConfig
 
 
+# Copyright 2025 The HuggingFace Team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+
 class DataCollatorForCompletionOnlyLM(DataCollatorForLanguageModeling):
     """
     Data collator used for completion tasks. It ensures that all the tokens of the labels are set to an 'ignore_index'
@@ -1647,3 +1663,59 @@ def flush_left(mask: torch.Tensor, *tensors: torch.Tensor) -> tuple[torch.Tensor
         return mask
     else:
         return mask, *tensors
+
+
+def compute_token_accuracy(logits: torch.Tensor, labels: torch.Tensor, ignore_index: int = -100) -> float:
+    """
+    Compute the mean token accuracy.
+    """
+    # Get predictions
+    predictions = logits.argmax(dim=-1)
+
+    # Create mask for non-padding tokens (assuming pad_token_id is ignore_index)
+    mask = labels != ignore_index
+
+    # Calculate accuracy only on non-padding tokens
+    correct_predictions = (predictions == labels) & mask
+    total_tokens = mask.sum()
+    correct_tokens = correct_predictions.sum()
+
+    # Calculate accuracy
+    accuracy = correct_tokens.item() / total_tokens.item() if total_tokens > 0 else 0.0
+
+    return accuracy
+
+
+def selective_log_softmax(logits, index):
+    """
+    A memory-efficient implementation of the common `log_softmax -> gather` operation.
+
+    This function is equivalent to the following naive implementation:
+    ```python
+    logps = torch.gather(logits.log_softmax(-1), dim=-1, index=index.unsqueeze(-1)).squeeze(-1)
+    ```
+
+    Args:
+        logits (`torch.Tensor`):
+            Logits tensor of shape `(..., num_classes)`.
+        index (`torch.Tensor`):
+            Index tensor of shape `(...)`, specifying the positions to gather from the log-softmax output.
+
+    Returns:
+        `torch.Tensor`:
+            Gathered log probabilities with the same shape as `index`.
+    """
+    if logits.dtype in [torch.float32, torch.float64]:
+        selected_logits = torch.gather(logits, dim=-1, index=index.unsqueeze(-1)).squeeze(-1)
+        # loop to reduce peak mem consumption
+        logsumexp_values = torch.stack([torch.logsumexp(lg, dim=-1) for lg in logits])
+        per_token_logps = selected_logits - logsumexp_values  # log_softmax(x_i) = x_i - logsumexp(x)
+    else:
+        # logsumexp approach is unstable with bfloat16, fall back to slightly less efficent approach
+        per_token_logps = []
+        for row_logits, row_labels in zip(logits, index):  # loop to reduce peak mem consumption
+            row_logps = F.log_softmax(row_logits, dim=-1)
+            row_per_token_logps = row_logps.gather(dim=-1, index=row_labels.unsqueeze(-1)).squeeze(-1)
+            per_token_logps.append(row_per_token_logps)
+        per_token_logps = torch.stack(per_token_logps)
+    return per_token_logps
