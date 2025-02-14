@@ -583,6 +583,8 @@ class GRPOTrainer(Trainer):
         ):
             if isinstance(reward_func, nn.Module):  # Module instead of PretrainedModel for compat with compiled models
                 print("here")
+                print(inputs[0].keys())
+                print("here")
                 if is_conversational(inputs[0]):
                     messages = [{"messages": p + c} for p, c in zip(prompts, completions)]
                     texts = [apply_chat_template(x, reward_processing_class)["text"] for x in messages]

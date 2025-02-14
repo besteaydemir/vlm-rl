@@ -27,6 +27,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.utils.data
+import torch.nn.functional as F
 from accelerate import Accelerator, PartialState
 from accelerate.state import AcceleratorState
 from huggingface_hub import ModelCard, ModelCardData

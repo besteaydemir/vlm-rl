@@ -5,6 +5,7 @@ from transformers import (
     AutoProcessor,
     AutoModelForSequenceClassification,
     AutoTokenizer,
+    AutoModel,
     default_data_collator
 )
 from peft import get_peft_model, LoraConfig
@@ -19,11 +20,13 @@ def main():
     processor = AutoProcessor.from_pretrained(model_name, do_image_splitting=False)
 
     # Reward model setup
-    reward_model = AutoModelForSequenceClassification.from_pretrained(
-        "cleanrl/EleutherAI_pythia-1b-deduped__reward__tldr", 
-        torch_dtype=torch.bfloat16
+    reward_model = AutoModel.from_pretrained(
+        "internlm/internlm-xcomposer2d5-7b-reward", 
+        torch_dtype=torch.bfloat16,
+        trust_remote_code=True,
     )
-    reward_tokenizer = AutoTokenizer.from_pretrained(reward_model.config._name_or_path)
+    reward_tokenizer = AutoTokenizer.from_pretrained(reward_model.config._name_or_path, trust_remote_code=True)
+    reward_model.tokenizer = tokenizer
 
     # PEFT configuration
     peft_config = LoraConfig(
