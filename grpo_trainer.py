@@ -477,7 +477,9 @@ class GRPOTrainer(Trainer):
     #     return output
 
     def _prepare_inputs(self, inputs: dict[str, Union[torch.Tensor, Any]]) -> dict[str, Union[torch.Tensor, Any]]:
-        print("prepare")
+        # print("prepare")
+        # print("inputs here")
+        # print(inputs)
         device = self.accelerator.device
         prompts = [x["question"] for x in inputs] # list for the whole inputs
         images = [x["image"] for x in inputs]
@@ -492,7 +494,7 @@ class GRPOTrainer(Trainer):
             text = prompts_text, images = images, return_tensors="pt", padding=True, padding_side="left", add_special_tokens=False
         )
         prompt_inputs = super()._prepare_inputs(prompt_inputs)
-        print(prompt_inputs.keys())
+        #print(prompt_inputs.keys())
         prompt_ids, prompt_mask, pixel_values = prompt_inputs["input_ids"], prompt_inputs["attention_mask"], prompt_inputs["pixel_values"]
 
         if self.max_prompt_length is not None:
@@ -573,32 +575,39 @@ class GRPOTrainer(Trainer):
         # Decode the generated completions
         completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
         if is_conversational(inputs[0]):
+            #print("is conversational")
             completions = [[{"role": "assistant", "content": completion}] for completion in completions_text]
         else:
             completions = completions_text
+
+        #print("completions", completions)
 
         rewards_per_func = torch.zeros(len(prompts), len(self.reward_funcs), device=device)
         for i, (reward_func, reward_processing_class) in enumerate(
             zip(self.reward_funcs, self.reward_processing_classes)
         ):
             if isinstance(reward_func, nn.Module):  # Module instead of PretrainedModel for compat with compiled models
-                print("here")
-                print(inputs[0].keys())
-                print("here")
+                #print("here")
+                #print(inputs[0].keys())
+                #print("here")
+                #print(prompts)
                 if is_conversational(inputs[0]):
                     messages = [{"messages": p + c} for p, c in zip(prompts, completions)]
                     texts = [apply_chat_template(x, reward_processing_class)["text"] for x in messages]
                 else:
                     texts = [p + c for p, c in zip(prompts, completions)]
+
                 reward_inputs = reward_processing_class(
                     texts, return_tensors="pt", padding=True, padding_side="right", add_special_tokens=False
                 )
+                #print("reward_inputs", reward_inputs)
                 reward_inputs = super()._prepare_inputs(reward_inputs)
+                #print("rewar", reward_inputs)
                 with torch.inference_mode():
                     rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]  # Shape (B*G,)
             else:
                 # Repeat all input columns (but "prompt" and "completion") to match the number of generations
-                print("iam here", input.keys())
+                #print("iam here", input.keys())
                 keys = [key for key in inputs[0] if key not in ["prompt", "completion"]]
                 reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
                 output_reward_func = reward_func(prompts=prompts, completions=completions, **reward_kwargs)
@@ -661,6 +670,7 @@ class GRPOTrainer(Trainer):
         return {
             "prompt_ids": prompt_ids,
             "prompt_mask": prompt_mask,
+            "pixel_values": pixel_values,
             "completion_ids": completion_ids,
             "completion_mask": completion_mask,
             "ref_per_token_logps": ref_per_token_logps,
@@ -671,15 +681,15 @@ class GRPOTrainer(Trainer):
         if return_outputs:
             raise ValueError("The GRPOTrainer does not support returning outputs")
         # Compute the per-token log probabilities for the model
-        print(inputs.keys())
+        #print(inputs.keys())
 
-        prompt_ids, prompt_mask, pixel_values = inputs["prompt_ids"], inputs["prompt_mask"],
+        prompt_ids, prompt_mask, pixel_values = inputs["prompt_ids"], inputs["prompt_mask"], inputs["pixel_values"]
         completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"]
         input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
 
-        per_token_logps = self._get_per_token_logps(model, input_ids, pixel_values, attention_mask, logits_to_keep)
+        per_token_logps = self._get_per_token_logps(model, input_ids, pixel_values, logits_to_keep, attention_mask)
 
         # Compute the KL divergence between the model and the reference model
         ref_per_token_logps = inputs["ref_per_token_logps"]

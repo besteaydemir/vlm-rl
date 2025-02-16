@@ -16,7 +16,6 @@ import wandb
 def main():
     # Model initialization
     model_name = "HuggingFaceM4/idefics2-8b"
-    #model_name = "HuggingFaceTB/SmolVLM-Instruct"
     model = AutoModelForVision2Seq.from_pretrained(model_name, torch_dtype=torch.bfloat16)
     processor = AutoProcessor.from_pretrained(model_name, do_image_splitting=False)
 
