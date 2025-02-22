@@ -575,10 +575,13 @@ class GRPOTrainer(Trainer):
         # Decode the generated completions
         completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
         if is_conversational(inputs[0]):
-            #print("is conversational")
+            print("is conversational")
             completions = [[{"role": "assistant", "content": completion}] for completion in completions_text]
+            print(completions)
         else:
+            print("not conversational")
             completions = completions_text
+            print(completions)
 
         #print("completions", completions)
 
@@ -587,24 +590,31 @@ class GRPOTrainer(Trainer):
             zip(self.reward_funcs, self.reward_processing_classes)
         ):
             if isinstance(reward_func, nn.Module):  # Module instead of PretrainedModel for compat with compiled models
-                #print("here")
-                #print(inputs[0].keys())
-                #print("here")
-                #print(prompts)
+                print("here")
+                print(inputs[0].keys())
+                print("here")
+                print(prompts)
                 if is_conversational(inputs[0]):
+                    print("is conversational")
                     messages = [{"messages": p + c} for p, c in zip(prompts, completions)]
+                    print(messages)
                     texts = [apply_chat_template(x, reward_processing_class)["text"] for x in messages]
+                    print("texts", texts)
                 else:
+                    print("not conversational")
                     texts = [p + c for p, c in zip(prompts, completions)]
+                    print("texts", texts)
 
                 reward_inputs = reward_processing_class(
                     texts, return_tensors="pt", padding=True, padding_side="right", add_special_tokens=False
                 )
-                #print("reward_inputs", reward_inputs)
+                print("reward_inputs", reward_inputs)
                 reward_inputs = super()._prepare_inputs(reward_inputs)
-                #print("rewar", reward_inputs)
+                print("reward prepared", reward_inputs)
                 with torch.inference_mode():
                     rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]  # Shape (B*G,)
+                print(rewards_per_func.shape)
+                print(rewards_per_func)
             else:
                 # Repeat all input columns (but "prompt" and "completion") to match the number of generations
                 #print("iam here", input.keys())

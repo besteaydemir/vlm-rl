@@ -43,6 +43,7 @@ def main():
     # Dataset preparation
     dataset = load_dataset("openbmb/RLAIF-V-Dataset", split="train[:1%]")
 
+
     # def format_example(example):
     #     # Prepare multimodal prompt
     #     prompt = [{
@@ -80,9 +81,11 @@ def main():
         gradient_checkpointing=True,
         per_device_train_batch_size=2,
         gradient_accumulation_steps=32,
-        num_train_epochs=2,
+        num_train_epochs=1,
         learning_rate=1e-5,
-        report_to="wandb"
+        logging_steps =1,
+        report_to="wandb",
+        log_completions=True
     )
 
     # Initialize WandB
