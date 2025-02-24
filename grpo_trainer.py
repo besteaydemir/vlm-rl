@@ -600,19 +600,45 @@ class GRPOTrainer(Trainer):
                     print(messages)
                     texts = [apply_chat_template(x, reward_processing_class)["text"] for x in messages]
                     print("texts", texts)
+                elif True: #TODO change this
+                    print("my verison")
+                    def chat_version(prompt, completion):
+                        chat = [
+                            {"role": "user", "content": prompt},
+                            {"role": "assistant", "content": completion}]
+                        return chat
+                    
+                    texts = [chat_version(p,c) for p, c in zip(prompts, completions)]
+                    print(texts)
+
                 else:
                     print("not conversational")
                     texts = [p + c for p, c in zip(prompts, completions)]
                     print("texts", texts)
 
-                reward_inputs = reward_processing_class(
-                    texts, return_tensors="pt", padding=True, padding_side="right", add_special_tokens=False
-                )
-                print("reward_inputs", reward_inputs)
-                reward_inputs = super()._prepare_inputs(reward_inputs)
-                print("reward prepared", reward_inputs)
-                with torch.inference_mode():
-                    rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]  # Shape (B*G,)
+                # reward_inputs = reward_processing_class(
+                #     texts, return_tensors="pt", padding=True, padding_side="right", add_special_tokens=False
+                # )
+                # print("reward_inputs", reward_inputs)
+                # reward_inputs = super()._prepare_inputs(reward_inputs)
+                # print("reward prepared", reward_inputs)
+                # with torch.inference_mode():
+                #     rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]  # Shape (B*G,)
+
+                #image_paths = [input_one["image_path"] for input_one in inputs]
+                images_list = [input_one["image"] for input_one in inputs]
+                image_paths = []
+                saving_path = "image.jpg"
+                for image_ in images_list:
+                    image_.save(saving_path)
+                    image_paths.append([saving_path])
+                
+                print(image_paths)
+                print(images_list)
+                with torch.autocast(device_type='cuda', dtype=torch.float16):
+                    rewards_per_func[:, i] = torch.FloatTensor(reward_func.get_scores(texts, image_paths, hd_num=2)).to('cuda') # Shape (B*G,)
+
+
                 print(rewards_per_func.shape)
                 print(rewards_per_func)
             else:

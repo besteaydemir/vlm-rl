@@ -126,7 +126,7 @@ class GRPOConfig(TrainingArguments):
         },
     )
     max_prompt_length: Optional[int] = field(
-        default=128,
+        default=512,
         metadata={
             "help": "Maximum length of the prompt. If the prompt is longer than this value, it will be truncated left."
         },
