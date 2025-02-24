@@ -438,7 +438,7 @@ class GRPOTrainer(Trainer):
         #     index=input_ids.unsqueeze(-1)
         # ).squeeze(-1)
         
-        # return per_token_logps
+        # return pere_token_logps
         return selective_log_softmax(logits, input_ids)
   
     # @staticmethod
