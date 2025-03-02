@@ -192,7 +192,7 @@ class GRPOTrainer(Trainer):
 
 
         def data_collator(features):
-        # print(len([f["pixel_values"] for f in features][0]))
+        # #print(len([f["pixel_values"] for f in features][0]))
 
         # pixel_values = torch.stack([f["pixel_values"] for f in features])
         # prompt_input_ids = [torch.tensor(f["prompt_input_ids"]) for f in features]
@@ -229,9 +229,10 @@ class GRPOTrainer(Trainer):
             reward_funcs = [reward_funcs]
         for i, reward_func in enumerate(reward_funcs):
             if isinstance(reward_func, str):
-                reward_funcs[i] = AutoModelForSequenceClassification.from_pretrained(
-                    reward_func, num_labels=1, **model_init_kwargs
-                )
+                raise NotImplementedError("AutoModelForSequenceClassification from string reward function is not implemented yet.")
+                # reward_funcs[i] = AutoModelForSequenceClassification.from_pretrained(
+                #     reward_func, num_labels=1, **model_init_kwargs
+                # )
         self.reward_funcs = reward_funcs
 
         # Reward processing class
@@ -243,15 +244,23 @@ class GRPOTrainer(Trainer):
             if len(reward_processing_classes) != len(reward_funcs):
                 raise ValueError("The number of reward processing classes must match the number of reward functions.")
 
+        # for i, (reward_processing_class, reward_func) in enumerate(zip(reward_processing_classes, reward_funcs)):
+        #     if isinstance(reward_func, PreTrainedModel):
+        #         if reward_processing_class is None:
+        #             reward_processing_class = AutoProcessor.from_pretrained(reward_func.config._name_or_path)
+        #         if reward_processing_class.pad_token_id is None:
+        #             reward_processing_class.pad_token = reward_processing_class.eos_token
+        #         # The reward model computes the reward for the latest non-padded token in the input sequence.
+        #         # So it's important to set the pad token ID to the padding token ID of the processing class.
+        #         reward_func.config.pad_token_id = reward_processing_class.pad_token_id
+        #         reward_processing_classes[i] = reward_processing_class
         for i, (reward_processing_class, reward_func) in enumerate(zip(reward_processing_classes, reward_funcs)):
             if isinstance(reward_func, PreTrainedModel):
-                if reward_processing_class is None:
-                    reward_processing_class = AutoProcessor.from_pretrained(reward_func.config._name_or_path)
-                if reward_processing_class.pad_token_id is None:
-                    reward_processing_class.pad_token = reward_processing_class.eos_token
-                # The reward model computes the reward for the latest non-padded token in the input sequence.
-                # So it's important to set the pad token ID to the padding token ID of the processing class.
-                reward_func.config.pad_token_id = reward_processing_class.pad_token_id
+                # if reward_processing_class.pad_token_id is None:
+                #     reward_processing_class.pad_token = reward_processing_class.eos_token TODO: My reward function has a get score function
+                # # The reward model computes the reward for the latest non-padded token in the input sequence.
+                # # So it's important to set the pad token ID to the padding token ID of the processing class.
+                # reward_func.config.pad_token_id = reward_processing_class.pad_token_id
                 reward_processing_classes[i] = reward_processing_class
         self.reward_processing_classes = reward_processing_classes
 
@@ -373,7 +382,7 @@ class GRPOTrainer(Trainer):
                 max_new_tokens=self.max_completion_length,
                 do_sample=True,
                 temperature=args.temperature,
-                pad_token_id=processing_class.tokenizer.pad_token_id if True else processing_class.pad_token_id,
+                pad_token_id=processing_class.tokenizer.pad_token_id, # if True else processing_class.pad_token_id,
             )
 
         # Gradient accumulation requires scaled loss. Normally, loss scaling in the parent class depends on whether the
@@ -477,9 +486,9 @@ class GRPOTrainer(Trainer):
     #     return output
 
     def _prepare_inputs(self, inputs: dict[str, Union[torch.Tensor, Any]]) -> dict[str, Union[torch.Tensor, Any]]:
-        # print("prepare")
-        # print("inputs here")
-        # print(inputs)
+        # #print("prepare")
+        # #print("inputs here")
+        # #print(inputs)
         device = self.accelerator.device
         prompts = [x["question"] for x in inputs] # list for the whole inputs
         images = [x["image"] for x in inputs]
@@ -494,8 +503,9 @@ class GRPOTrainer(Trainer):
             text = prompts_text, images = images, return_tensors="pt", padding=True, padding_side="left", add_special_tokens=False
         )
         prompt_inputs = super()._prepare_inputs(prompt_inputs)
-        #print(prompt_inputs.keys())
+        ##print(prompt_inputs.keys())
         prompt_ids, prompt_mask, pixel_values = prompt_inputs["input_ids"], prompt_inputs["attention_mask"], prompt_inputs["pixel_values"]
+        pixel_attention_mask = prompt_inputs["pixel_attention_mask"] 
 
         if self.max_prompt_length is not None:
             prompt_ids = prompt_ids[:, -self.max_prompt_length :]
@@ -541,7 +551,7 @@ class GRPOTrainer(Trainer):
             # Regular generation path
             with unwrap_model_for_generation(self.model, self.accelerator) as unwrapped_model:
                 prompt_completion_ids = unwrapped_model.generate(
-                    input_ids =prompt_ids, pixel_values=pixel_values, attention_mask=prompt_mask, generation_config=self.generation_config
+                    input_ids =prompt_ids, pixel_values=pixel_values, attention_mask=prompt_mask, pixel_attention_mask=pixel_attention_mask, generation_config=self.generation_config
                 )
 
             # Compute prompt length and extract completion ids
@@ -575,33 +585,33 @@ class GRPOTrainer(Trainer):
         # Decode the generated completions
         completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
         if is_conversational(inputs[0]):
-            print("is conversational")
+            #print("is conversational")
             completions = [[{"role": "assistant", "content": completion}] for completion in completions_text]
-            print(completions)
+            #print(completions)
         else:
-            print("not conversational")
+            #print("not conversational")
             completions = completions_text
-            print(completions)
+            #print(completions)
 
-        #print("completions", completions)
+        ##print("completions", completions)
 
         rewards_per_func = torch.zeros(len(prompts), len(self.reward_funcs), device=device)
         for i, (reward_func, reward_processing_class) in enumerate(
             zip(self.reward_funcs, self.reward_processing_classes)
         ):
             if isinstance(reward_func, nn.Module):  # Module instead of PretrainedModel for compat with compiled models
-                print("here")
-                print(inputs[0].keys())
-                print("here")
-                print(prompts)
+                #print("here")
+                #print(inputs[0].keys())
+                #print("here")
+                #print(prompts)
                 if is_conversational(inputs[0]):
-                    print("is conversational")
+                    #print("is conversational")
                     messages = [{"messages": p + c} for p, c in zip(prompts, completions)]
-                    print(messages)
+                    #print(messages)
                     texts = [apply_chat_template(x, reward_processing_class)["text"] for x in messages]
-                    print("texts", texts)
+                    #print("texts", texts)
                 elif True: #TODO change this
-                    print("my verison")
+                    #print("my verison")
                     def chat_version(prompt, completion):
                         chat = [
                             {"role": "user", "content": prompt},
@@ -609,19 +619,19 @@ class GRPOTrainer(Trainer):
                         return chat
                     
                     texts = [chat_version(p,c) for p, c in zip(prompts, completions)]
-                    print(texts)
+                    #print(texts)
 
                 else:
-                    print("not conversational")
+                    #print("not conversational")
                     texts = [p + c for p, c in zip(prompts, completions)]
-                    print("texts", texts)
+                    #print("texts", texts)
 
                 # reward_inputs = reward_processing_class(
                 #     texts, return_tensors="pt", padding=True, padding_side="right", add_special_tokens=False
                 # )
-                # print("reward_inputs", reward_inputs)
+                # #print("reward_inputs", reward_inputs)
                 # reward_inputs = super()._prepare_inputs(reward_inputs)
-                # print("reward prepared", reward_inputs)
+                # #print("reward prepared", reward_inputs)
                 # with torch.inference_mode():
                 #     rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]  # Shape (B*G,)
 
@@ -633,17 +643,17 @@ class GRPOTrainer(Trainer):
                     image_.save(saving_path)
                     image_paths.append([saving_path])
                 
-                print(image_paths)
-                print(images_list)
+                #print(image_paths)
+                #print(images_list)
                 with torch.autocast(device_type='cuda', dtype=torch.float16):
                     rewards_per_func[:, i] = torch.FloatTensor(reward_func.get_scores(texts, image_paths, hd_num=2)).to('cuda') # Shape (B*G,)
 
 
-                print(rewards_per_func.shape)
-                print(rewards_per_func)
+                #print(rewards_per_func.shape)
+                #print(rewards_per_func)
             else:
                 # Repeat all input columns (but "prompt" and "completion") to match the number of generations
-                #print("iam here", input.keys())
+                ##print("iam here", input.keys())
                 keys = [key for key in inputs[0] if key not in ["prompt", "completion"]]
                 reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
                 output_reward_func = reward_func(prompts=prompts, completions=completions, **reward_kwargs)
@@ -717,7 +727,7 @@ class GRPOTrainer(Trainer):
         if return_outputs:
             raise ValueError("The GRPOTrainer does not support returning outputs")
         # Compute the per-token log probabilities for the model
-        #print(inputs.keys())
+        ##print(inputs.keys())
 
         prompt_ids, prompt_mask, pixel_values = inputs["prompt_ids"], inputs["prompt_mask"], inputs["pixel_values"]
         completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"]
@@ -751,7 +761,7 @@ class GRPOTrainer(Trainer):
     #     if return_outputs:
     #         raise ValueError("GRPOTrainer does not support returning outputs")
 
-    #     print(inputs.keys())
+    #     #print(inputs.keys())
     #     prompt_input_ids = inputs["prompt_ids"]
     #     pixel_values = inputs["pixel_values"]
     #     prompts = inputs["prompt"]
