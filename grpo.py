@@ -19,7 +19,8 @@ def main():
     #model_name = "HuggingFaceTB/SmolVLM-Instruct"
     model = AutoModelForVision2Seq.from_pretrained(model_name, torch_dtype=torch.bfloat16)
     processor = AutoProcessor.from_pretrained(model_name, do_image_splitting=False)
-
+    processor.tokenizer.padding_side = "left"
+    
     # Reward model setup
     reward_model = AutoModel.from_pretrained(
         "internlm/internlm-xcomposer2d5-7b-reward", 
@@ -28,6 +29,10 @@ def main():
     )
     reward_tokenizer = AutoTokenizer.from_pretrained(reward_model.config._name_or_path, trust_remote_code=True)
     reward_model.tokenizer = reward_tokenizer
+    #move the model to cuda 1
+    reward_model.to("cuda:1")
+    reward_model.eval()
+
 
     # There is a weird way to use this reward model 
     # https://huggingface.co/internlm/internlm-xcomposer2d5-7b-reward
@@ -37,8 +42,8 @@ def main():
     peft_config = LoraConfig(
         target_modules="all-linear"
     )
-    model = get_peft_model(model, peft_config)
-    model.print_trainable_parameters()
+    # model = get_peft_model(model, peft_config)
+    # model.print_trainable_parameters()
 
     # Dataset preparation
     dataset = load_dataset("openbmb/RLAIF-V-Dataset", split="train[:1%]")
@@ -80,7 +85,7 @@ def main():
         bf16=True,
         gradient_checkpointing=True,
         per_device_train_batch_size=2,
-        gradient_accumulation_steps=32,
+        gradient_accumulation_steps=4,
         num_train_epochs=1,
         learning_rate=1e-5,
         logging_steps =1,
