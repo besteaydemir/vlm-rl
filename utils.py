@@ -26,13 +26,11 @@ import datasets
 import numpy as np
 import pandas as pd
 import torch
-import torch.utils.data
 import torch.nn.functional as F
+import torch.utils.data
 from accelerate import Accelerator, PartialState
 from accelerate.state import AcceleratorState
 from huggingface_hub import ModelCard, ModelCardData
-from rich.console import Console
-from rich.table import Table
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import IterableDataset
 from transformers import (
@@ -52,30 +50,21 @@ from transformers.utils import (
     is_torch_xpu_available,
 )
 
+from import_utils import is_rich_available
 from model_config import ModelConfig
 
+
+if is_rich_available():
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
 
 if is_comet_available():
     import comet_ml
 
 if is_peft_available():
     from peft import LoraConfig, PeftConfig
-
-
-# Copyright 2025 The HuggingFace Team. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 
 
 class DataCollatorForCompletionOnlyLM(DataCollatorForLanguageModeling):
@@ -156,7 +145,7 @@ class DataCollatorForCompletionOnlyLM(DataCollatorForLanguageModeling):
                     warnings.warn(
                         f"Could not find response key `{self.response_template}` in the following instance: "
                         f"{self.tokenizer.decode(batch['input_ids'][i])}. This instance will be ignored in loss "
-                        "calculation. Note, if this happens often, consider increasing the `max_seq_length`.",
+                        "calculation. Note, if this happens often, consider increasing the `max_length`.",
                         UserWarning,
                     )
                     batch["labels"][i, :] = self.ignore_index
@@ -183,7 +172,7 @@ class DataCollatorForCompletionOnlyLM(DataCollatorForLanguageModeling):
                     warnings.warn(
                         f"Could not find response key `{self.response_template}` in the following instance: "
                         f"{self.tokenizer.decode(batch['input_ids'][i])}. This instance will be ignored in loss "
-                        "calculation. Note, if this happens often, consider increasing the `max_seq_length`.",
+                        "calculation. Note, if this happens often, consider increasing the `max_length`.",
                         UserWarning,
                     )
                     batch["labels"][i, :] = self.ignore_index
@@ -198,7 +187,7 @@ class DataCollatorForCompletionOnlyLM(DataCollatorForLanguageModeling):
                     warnings.warn(
                         f"Could not find instruction key `{self.instruction_template}` in the following instance: "
                         f"{self.tokenizer.decode(batch['input_ids'][i])}. This instance will be ignored in loss "
-                        "calculation. Note, if this happens often, consider increasing the `max_seq_length`.",
+                        "calculation. Note, if this happens often, consider increasing the `max_length`.",
                         UserWarning,
                     )
                     batch["labels"][i, :] = self.ignore_index
@@ -931,6 +920,7 @@ def get_peft_config(model_args: ModelConfig) -> "Optional[PeftConfig]":
         lora_dropout=model_args.lora_dropout,
         bias="none",
         use_rslora=model_args.use_rslora,
+        use_dora=model_args.use_dora,
         modules_to_save=model_args.lora_modules_to_save,
     )
 
@@ -1666,27 +1656,6 @@ def flush_left(mask: torch.Tensor, *tensors: torch.Tensor) -> tuple[torch.Tensor
         return mask, *tensors
 
 
-def compute_token_accuracy(logits: torch.Tensor, labels: torch.Tensor, ignore_index: int = -100) -> float:
-    """
-    Compute the mean token accuracy.
-    """
-    # Get predictions
-    predictions = logits.argmax(dim=-1)
-
-    # Create mask for non-padding tokens (assuming pad_token_id is ignore_index)
-    mask = labels != ignore_index
-
-    # Calculate accuracy only on non-padding tokens
-    correct_predictions = (predictions == labels) & mask
-    total_tokens = mask.sum()
-    correct_tokens = correct_predictions.sum()
-
-    # Calculate accuracy
-    accuracy = correct_tokens.item() / total_tokens.item() if total_tokens > 0 else 0.0
-
-    return accuracy
-
-
 def selective_log_softmax(logits, index):
     """
     A memory-efficient implementation of the common `log_softmax -> gather` operation.
@@ -1720,3 +1689,57 @@ def selective_log_softmax(logits, index):
             per_token_logps.append(row_per_token_logps)
         per_token_logps = torch.stack(per_token_logps)
     return per_token_logps
+
+
+def print_prompt_completions_sample(prompts: list[str], completions: list[str], rewards: list[int], step: int) -> None:
+    """
+    Print out a sample of model completions to the console.
+
+    This function creates a nicely formatted table showing prompt-completion pairs, useful for monitoring model outputs
+    during training. It requires the `rich` library to be installed.
+
+    Args:
+        prompts (`list[str]`):
+            List of prompts.
+        completions (`list[str]`):
+            List of completions corresponding to the prompts.
+        reward (`list[float]`):
+            List of rewards corresponding to the completions.
+        step (`int`):
+            Current training step number, used in the output title.
+
+    Example:
+    ```python
+    >>> from trl.trainer.utils import print_prompt_completions_sample
+    >>> prompts = ["The sky is", "The sun is"]
+    >>> completions = [" blue.", " in the sky."]
+    >>> rewards = [0.12345, 0.68789]
+    >>> print_prompt_completions_sample(prompts, completions, rewards, 42)
+    ╭─────────────── Step 42 ────────────────╮
+    │ ┏━━━━━━━━━━━━┳━━━━━━━━━━━━━━┳━━━━━━━━┓ │
+    │ ┃ Prompt     ┃ Completion   ┃ Reward ┃ │
+    │ ┡━━━━━━━━━━━━╇━━━━━━━━━━━━━━╇━━━━━━━━┩ │
+    │ │ The sky is │  blue.       │   0.12 │ │
+    │ ├────────────┼──────────────┼────────┤ │
+    │ │ The sun is │  in the sky. │   0.68 │ │
+    │ └────────────┴──────────────┴────────┘ │
+    ╰────────────────────────────────────────╯
+    ```
+    """
+    if not is_rich_available():
+        raise ImportError("This feature requires `rich` to be installed. Please install it first: `pip install rich`")
+
+    console = Console()
+    table = Table(show_header=True, header_style="bold white", expand=True)
+
+    # Add columns
+    table.add_column("Prompt", style="bright_yellow")
+    table.add_column("Completion", style="bright_green")
+    table.add_column("Reward", style="bold cyan", justify="right")
+
+    for prompt, completion, reward in zip(prompts, completions, rewards, strict=True):
+        table.add_row(Text(prompt), Text(completion), f"{reward:.2f}")  # Formatting reward to 2 decimal places
+        table.add_section()  # Adds a separator between rows
+
+    panel = Panel(table, expand=False, title=f"Step {step}", border_style="bold white")
+    console.print(panel)

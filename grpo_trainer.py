@@ -6,7 +6,7 @@ from typing import Any, Callable, Optional, Sized, Union
 import torch
 import torch.utils.data
 import transformers
-from accelerate.utils import broadcast_object_list, gather, gather_object
+from accelerate.utils import broadcast_object_list, gather, gather_object, is_peft_model, set_seed
 from accelerate.utils.other import is_compiled_module
 from datasets import Dataset, IterableDataset
 from packaging import version
@@ -31,10 +31,12 @@ from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
 from transformers.utils import is_peft_available
 
 from data_utils import apply_chat_template, is_conversational, maybe_apply_chat_template
+from extras import profiling_context, profiling_decorator
 from models.utils import unwrap_model_for_generation
 from modeling_base import create_reference_model
 from grpo_config import GRPOConfig
-from utils import generate_model_card, get_comet_experiment_url, pad, selective_log_softmax
+from utils import generate_model_card, get_comet_experiment_url, pad, selective_log_softmax, print_prompt_completions_sample
+from import_utils import is_rich_available, is_vllm_available
 
 
 from PIL import Image
@@ -53,33 +55,91 @@ RewardFunc = Union[str, PreTrainedModel, Callable[[list, list], list[float]]]
 
 class RepeatRandomSampler(Sampler):
     """
-    Sampler that repeats the indices of a dataset N times.
+    Sampler that repeats the indices of a dataset in a structured manner.
 
     Args:
         data_source (`Sized`):
             Dataset to sample from.
-        repeat_count (`int`):
-            Number of times to repeat each index.
+        mini_repeat_count (`int`):
+            Number of times to repeat each index per batch.
+        batch_size (`int`, *optional*, defaults to `1`):
+            Number of unique indices per batch.
+        repeat_count (`int`, *optional*, defaults to `1`):
+            Number of times to repeat the full sampling process.
+        seed (`int` or `None`, *optional*, defaults to `None`):
+            Random seed for reproducibility (only affects this sampler).
 
     Example:
     ```python
-    >>> sampler = RepeatRandomSampler(["a", "b", "c", "d"], repeat_count=2)
+    >>> sampler = RepeatRandomSampler(["a", "b", "c", "d", "e", "f", "g"], mini_repeat_count=2, batch_size=3, repeat_count=4)
     >>> list(sampler)
-    [2, 2, 0, 0, 3, 3, 1, 1]
+    [4, 4, 3, 3, 0, 0,
+     4, 4, 3, 3, 0, 0,
+     4, 4, 3, 3, 0, 0,
+     4, 4, 3, 3, 0, 0,
+
+     1, 1, 2, 2, 6, 6,
+     1, 1, 2, 2, 6, 6,
+     1, 1, 2, 2, 6, 6,
+     1, 1, 2, 2, 6, 6]
+    ```
+
+    ```txt
+    mini_repeat_count = 3
+          -   -   -
+         [0,  0,  0,  1,  1,  1,  2,  2,  2,  3,  3,  3,      |
+          4,  4,  4,  5,  5,  5,  6,  6,  6,  7,  7,  7,      |
+          8,  8,  8,  9,  9,  9, 10, 10, 10, 11, 11, 11,      |
+                                                                repeat_count = 2
+          0,  0,  0,  1,  1,  1,  2,  2,  2,  3,  3,  3,      |
+          4,  4,  4,  5,  5,  5,  6,  6,  6,  7,  7,  7,      |
+          8,  8,  8,  9,  9,  9, 10, 10, 10, 11, 11, 11, ...] |
+          ---------   ---------   ---------   ---------
+           ---------   ---------   ---------   ---------
+            ---------   ---------   ---------   ---------
+                         batch_size = 12
     ```
     """
 
-    def __init__(self, data_source: Sized, repeat_count: int):
+    def __init__(
+        self,
+        data_source: Sized,
+        mini_repeat_count: int,
+        batch_size: int = 1,
+        repeat_count: int = 1,
+        seed: Optional[int] = None,
+    ):
         self.data_source = data_source
+        self.mini_repeat_count = mini_repeat_count
+        self.batch_size = batch_size
         self.repeat_count = repeat_count
         self.num_samples = len(data_source)
+        self.seed = seed
+        self.generator = torch.Generator()  # Create a local random generator
+        if seed is not None:
+            self.generator.manual_seed(seed)
 
     def __iter__(self):
-        indexes = [idx for idx in torch.randperm(self.num_samples).tolist() for _ in range(self.repeat_count)]
-        return iter(indexes)
+        # E.g., [2, 4, 3, 1, 0, 6, 5] (num_samples = 7)
+        indexes = torch.randperm(self.num_samples, generator=self.generator).tolist()
 
-    def __len__(self):
-        return self.num_samples * self.repeat_count
+        #    [2, 4, 3, 1, 0, 6, 5]
+        # -> [[2, 4, 3], [1, 0, 6], [5]]  (batch_size = 3)
+        indexes = [indexes[i : i + self.batch_size] for i in range(0, len(indexes), self.batch_size)]
+
+        #    [[2, 4, 3], [1, 0, 6], [5]]
+        # -> [[2, 4, 3], [1, 0, 6]]
+        indexes = [chunk for chunk in indexes if len(chunk) == self.batch_size]
+
+        for chunk in indexes:
+            for _ in range(self.repeat_count):
+                for index in chunk:
+                    for _ in range(self.mini_repeat_count):
+                        yield index
+
+    def __len__(self) -> int:
+        return self.num_samples * self.mini_repeat_count * self.repeat_count
+
 
 
 class GRPOTrainer(Trainer):
@@ -136,9 +196,9 @@ class GRPOTrainer(Trainer):
         if peft_config is not None:
             print("getting the peft config")
             model = get_peft_model(model, peft_config)
-            for name, param in model.named_parameters():
-                if param.requires_grad:
-                    print(f"Trainable: {name}")
+            # for name, param in model.named_parameters():
+            #     if param.requires_grad:
+            #         print(f"Trainable: {name}")
 
         if args.gradient_checkpointing:
             model = self._enable_gradient_checkpointing(model, args)
@@ -172,6 +232,17 @@ class GRPOTrainer(Trainer):
                 #     reward_func, num_labels=1, **model_init_kwargs
                 # )
         self.reward_funcs = reward_funcs
+
+        # Reward weights
+        if args.reward_weights is not None:
+            if len(args.reward_weights) != len(reward_funcs):
+                raise ValueError(
+                    f"Number of reward weights ({len(args.reward_weights)}) must match number of reward "
+                    f"functions ({len(reward_funcs)})"
+                )
+            self.reward_weights = torch.tensor(args.reward_weights, dtype=torch.float32)
+        else:
+            self.reward_weights = torch.ones(len(reward_funcs), dtype=torch.float32)
 
         # Reward processing class
         if reward_processing_classes is None:
@@ -370,7 +441,7 @@ class GRPOTrainer(Trainer):
                 max_new_tokens=self.max_completion_length,
                 do_sample=True,
                 temperature=args.temperature,
-                pad_token_id=processing_class.pad_token_id,
+                pad_token_id=processing_class.tokenizer.pad_token_id,
             )
 
         # Gradient accumulation requires scaled loss. Normally, loss scaling in the parent class depends on whether the
@@ -488,7 +559,7 @@ class GRPOTrainer(Trainer):
             pixel_values=pixel_values,
             attention_mask=attention_mask,
             pixel_attention_mask=pixel_attention_mask,
-            num_logits_to_keep=logits_to_keep + 1,
+            #num_logits_to_keep=logits_to_keep + 1,
             **kwargs
         )
         logits = outputs.logits  # (B, L, V)
@@ -601,7 +672,7 @@ class GRPOTrainer(Trainer):
             completion_ids = prompt_completion_ids[:, prompt_length:]
 
         # Mask everything after the first EOS token
-        is_eos = completion_ids == self.processing_class.eos_token_id
+        is_eos = completion_ids == self.processing_class.tokenizer.eos_token_id
         eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
         eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
         sequence_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
@@ -686,11 +757,12 @@ class GRPOTrainer(Trainer):
                     #print(image_paths)
                     #print(images_list)
                     with torch.inference_mode():
-                        # print reward functions device
-                        print("reward function device", reward_func.device)
 
-                        rewards_per_func[:, i] = torch.FloatTensor(reward_func.get_scores(texts, image_paths, hd_num=2)).to('cuda:1') # Shape (B*G,)
-                    print("reward per func", rewards_per_func)
+                        # print reward functions device
+                        #print("reward function device", reward_func.device)
+                        with torch.autocast(device_type='cuda', dtype=torch.float16):
+                            rewards_per_func[:, i] = torch.FloatTensor(reward_func.get_scores(texts, image_paths, hd_num=2)).to('cuda') # Shape (B*G,)
+                    #print("reward per func", rewards_per_func)
 
 
                 else:
@@ -746,13 +818,13 @@ class GRPOTrainer(Trainer):
             rewards_to_log = rewards.tolist()
 
             if self.accelerator.is_main_process:
-                if is_rich_available():
-                    print_prompt_completions_sample(
-                        prompts_to_log,
-                        completions_to_log,
-                        rewards_to_log,
-                        self.state.global_step,
-                    )
+                # if is_rich_available():
+                #     print_prompt_completions_sample(
+                #         prompts_to_log,
+                #         completions_to_log,
+                #         rewards_to_log,
+                #         self.state.global_step,
+                #     )
                 if self.args.report_to and "wandb" in self.args.report_to and wandb.run is not None:
                     import pandas as pd
 
@@ -835,7 +907,7 @@ class GRPOTrainer(Trainer):
         return loss, None, None
 
 
-   def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
+    def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
         mode = "eval" if self.control.should_evaluate else "train"
         metrics = {key: sum(val) / len(val) for key, val in self._metrics[mode].items()}  # average the metrics
 

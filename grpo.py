@@ -17,7 +17,10 @@ def main():
     # Model initialization
     model_name = "HuggingFaceM4/idefics2-8b"
     #model_name = "HuggingFaceTB/SmolVLM-Instruct"
+    model_name = "HuggingFaceTB/SmolVLM-256M-Base"
     model = AutoModelForVision2Seq.from_pretrained(model_name, torch_dtype=torch.bfloat16)
+    model.enable_input_require_grads()
+
     processor = AutoProcessor.from_pretrained(model_name, do_image_splitting=False)
     processor.tokenizer.padding_side = "left"
     
@@ -29,66 +32,26 @@ def main():
     )
     reward_tokenizer = AutoTokenizer.from_pretrained(reward_model.config._name_or_path, trust_remote_code=True)
     reward_model.tokenizer = reward_tokenizer
-    #move the model to cuda 1
-    reward_model.to("cuda:1")
     reward_model.eval()
-
-
-    # There is a weird way to use this reward model 
-    # https://huggingface.co/internlm/internlm-xcomposer2d5-7b-reward
-
 
     # PEFT configuration
     peft_config = LoraConfig(
         target_modules="all-linear"
     )
-    # model = get_peft_model(model, peft_config)
-    # model.print_trainable_parameters()
 
     # Dataset preparation
     dataset = load_dataset("openbmb/RLAIF-V-Dataset", split="train[:1%]")
-
-
-    # def format_example(example):
-    #     # Prepare multimodal prompt
-    #     prompt = [{
-    #         "role": "user", 
-    #         "content": [
-    #             {"type": "image"},
-    #             {"type": "text", "text": example["question"]}
-    #         ]
-    #     }]
-        
-    #     # Process images
-    #     example["image"].thumbnail((240, 240))
-        
-    #     return {
-    #         "images": [example["image"]],
-    #         "prompt": processor.apply_chat_template(prompt, tokenize=False),
-    #         "chosen": example["chosen"],
-    #         "rejected": example["rejected"]
-    #     }
-
-    # # Process dataset
-    # dataset = dataset.map(format_example, remove_columns=dataset.column_names, num_proc=32)
-    # dataset = dataset.cast(features.Features({
-    #     "images": features.Sequence(features.Image(decode=True)),
-    #     "prompt": features.Value("string"),
-    #     "chosen": features.Value("string"),
-    #     "rejected": features.Value("string")
-    # }))
-    #TODO bring key setting of the dataset here
 
     # Training configuration
     training_args = GRPOConfig(
         output_dir="idefics2-8b-grpo",
         bf16=True,
         gradient_checkpointing=True,
-        per_device_train_batch_size=2,
-        gradient_accumulation_steps=4,
+        per_device_train_batch_size=4,
+        gradient_accumulation_steps=16,
         num_train_epochs=1,
         learning_rate=1e-5,
-        logging_steps =1,
+        logging_steps=1,
         report_to="wandb",
         log_completions=True
     )
