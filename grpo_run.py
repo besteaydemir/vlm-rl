@@ -16,13 +16,14 @@ from grpo_config import GRPOConfig
 
 def main():
     # Model initialization
-    model_name = "HuggingFaceTB/SmolVLM-256M-Base"
+    model_name = "HuggingFaceTB/SmolVLM-256M-Instruct"
     model = AutoModelForVision2Seq.from_pretrained(model_name, torch_dtype=torch.bfloat16)
-    model.enable_input_require_grads()
+    #model.enable_input_require_grads()
 
-    processor = AutoProcessor.from_pretrained(model_name, do_image_splitting=False)
+    processor = AutoProcessor.from_pretrained(model_name, do_image_splitting=False) # This is for idefics
+    #processor = AutoProcessor.from_pretrained(model_name)
     processor.tokenizer.padding_side = "left"
-    
+   
     # Reward model setup
     reward_model_name = "internlm/internlm-xcomposer2d5-7b-reward"
     reward_model = AutoModel.from_pretrained(
@@ -33,6 +34,7 @@ def main():
     reward_tokenizer = AutoTokenizer.from_pretrained(reward_model.config._name_or_path, trust_remote_code=True)
     reward_model.tokenizer = reward_tokenizer
     reward_model.eval()
+    
 
     # PEFT configuration
     peft_config = LoraConfig(
@@ -49,7 +51,7 @@ def main():
         gradient_checkpointing=True,
         per_device_train_batch_size=4,
         gradient_accumulation_steps=16,
-        num_train_epochs=1,
+        num_train_epochs=2,
         learning_rate=1e-5,
         logging_steps=1,
         report_to="wandb",
@@ -78,7 +80,7 @@ def main():
     wandb.watch(model, log_freq=1)
 
     # Define a callback for logging metrics and saving checkpoints
-    class WandbLoggingCallback(TrainerCallback):
+    class WandbLoggingCallback(TrainerCallback): 
         def __init__(self, output_dir):
             self.output_dir = output_dir
 
@@ -90,7 +92,7 @@ def main():
         def on_step_end(self, args, state, control, **kwargs):
             """Save model checkpoints at 25%, 50%, 75%, and 100% of training."""
             total_steps = state.max_steps
-            checkpoint_intervals = [int(total_steps * frac) for frac in [0.25, 0.10, 0.5, 0.75, 1.0]]
+            checkpoint_intervals = [int(total_steps * frac) for frac in [0.25, 0.4, 0.10, 0.5, 0.75, 1.0]]
             checkpoint_intervals.append(1)
         
             print("checkpoint intervals", checkpoint_intervals)

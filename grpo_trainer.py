@@ -825,18 +825,29 @@ class GRPOTrainer(Trainer):
                 #         rewards_to_log,
                 #         self.state.global_step,
                 #     )
+                # if self.args.report_to and "wandb" in self.args.report_to and wandb.run is not None:
+                #     import pandas as pd
+
+                #     # For logging
+                #     table = {
+                #         "step": [str(self.state.global_step)] * len(rewards),
+                #         "prompt": prompts_to_log,
+                #         "completion": completions_to_log,
+                #         "reward": rewards.tolist(),
+                #     }
+                #     df = pd.DataFrame(table)
+                #     wandb.log({"completions": wandb.Table(dataframe=df)})
                 if self.args.report_to and "wandb" in self.args.report_to and wandb.run is not None:
                     import pandas as pd
+                    if not hasattr(self, "wandb_table"):
+                        self.wandb_table = wandb.Table(columns=["step", "prompt", "completion", "reward"])
 
-                    # For logging
-                    table = {
-                        "step": [str(self.state.global_step)] * len(rewards),
-                        "prompt": prompts_to_log,
-                        "completion": completions_to_log,
-                        "reward": rewards.tolist(),
-                    }
-                    df = pd.DataFrame(table)
-                    wandb.log({"completions": wandb.Table(dataframe=df)})
+                    # Append new data
+                    for p, c, r in zip(prompts_to_log, completions_to_log, rewards_to_log):
+                        self.wandb_table.add_data(str(self.state.global_step), p, c, r)
+
+                    # Log without overwriting
+                    wandb.log({"completions": self.wandb_table})
 
         return {
             "prompt_ids": prompt_ids,
